@@ -16,11 +16,13 @@ import fnmatch
 import logging
 import sys
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, time, timezone
+import time as t
 from os import environ
 from pathlib import Path
 
-import inotify.adapters
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 import requests
 
 logger = logging.getLogger("shaper_sync")
@@ -37,6 +39,7 @@ COMMON_HEADERS = {
     "Referer": f"{HUB_ORIGIN}/",
     "X-ApiVersion": "3.0.0",
 }
+
 
 
 class ShaperHubClient:
@@ -213,7 +216,6 @@ class ShaperHubClient:
         if include and not any(fnmatch.fnmatch(name, p) for p in include):
             return False
         return True
-
     def sync_directory(
         self,
         local_dir: Path,
@@ -324,45 +326,41 @@ class ShaperHubClient:
             stats["uploaded"], stats["updated"], stats["skipped"], stats["errors"],
         )
 
+        observer = Observer()
+        event_handler = sync_files(self, local_dir, remote_path)
         if recursive:
-            ino = inotify.adapters.InotifyTree(str(local_dir))
+            observer.schedule(event_handler, local_dir, recursive=True)
         else:
-            ino = inotify.adapters.Inotify()
-            ino.add_watch(str(local_dir))
-
+            observer.schedule(event_handler, local_dir)
+        observer.start()
         logger.info("Watching for changes... (Ctrl+C to stop)")
 
         try:
-            for event in ino.event_gen(yield_nones=False):
-                _, type_names, watch_path, filename = event
-
-                if not filename or filename.startswith("."):
-                    continue
-
-                if not self._file_matches(filename, include, exclude):
-                    continue
-
-                # Only react to file writes and moves
-                if not ({"IN_CLOSE_WRITE", "IN_MOVED_TO"} & set(type_names)):
-                    continue
-
-                full_path = Path(watch_path) / filename
-                if not full_path.is_file():
-                    continue
-
-                # Compute remote path from watched root
-                rel = full_path.parent.relative_to(local_dir)
-                rpath = remote_path.rstrip("/") + "/" if remote_path != "/" else "/"
-                if str(rel) != ".":
-                    rpath += str(rel) + "/"
-
-                try:
-                    self.sync_file(full_path, rpath)
-                except Exception as e:
-                    logger.error("ERROR for %s: %s", filename, e)
+            while True:
+                t.sleep(1) # Keep the main thread alive
         except KeyboardInterrupt:
-            logger.info("\nStopped.")
+            observer.stop()
+        observer.join()
 
+class sync_files(FileSystemEventHandler):
+    def __init__(self, client: ShaperHubClient, local_dir: Path, remote_path: str):
+        self.client = client
+        self.local_dir = local_dir
+        self.remote_path = remote_path
+
+    def on_any_event(self, event):
+        print("Event detected:", event)
+        if event.event_type in ["created", "modified"]:
+            full_path = Path(event.src_path)
+            rel = full_path.parent.relative_to(self.local_dir)
+            rpath = self.remote_path.rstrip("/") + "/" if self.remote_path != "/" else "/"
+            if str(rel) != ".":
+               rpath += str(rel) + "/"
+
+            try:
+                self.client.sync_file(full_path, rpath)
+            except Exception as e:
+                logger.error("ERROR for %s: %s", rel, e)
 
 def main() -> None:
     parser = argparse.ArgumentParser(
