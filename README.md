@@ -9,7 +9,7 @@ reverse-engineered API.
 
 Uploads new and modified files from a local directory to your Shaper Hub
 personal space. Supports recursive synchronization, dry-run mode, and
-continuous watch mode using inotify.
+continuous watch mode using watchdog.
 
 ## Installation
 
