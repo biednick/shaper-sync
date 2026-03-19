@@ -438,7 +438,7 @@ class ShaperHubClient:
         )
 
         observer = Observer()
-        event_handler = sync_files(self, local_dir, remote_path)
+        event_handler = sync_files(self, local_dir, remote_path, include=include, exclude=exclude)
         if recursive:
             observer.schedule(event_handler, local_dir, recursive=True)
         else:
@@ -458,10 +458,19 @@ class sync_files(FileSystemEventHandler):
     # reading a file that is still being written.
     DEBOUNCE = 0.5
 
-    def __init__(self, client: ShaperHubClient, local_dir: Path, remote_path: str):
+    def __init__(
+        self,
+        client: ShaperHubClient,
+        local_dir: Path,
+        remote_path: str,
+        include: list[str] | None = None,
+        exclude: list[str] | None = None,
+    ):
         self.client = client
         self.local_dir = local_dir
         self.remote_path = remote_path
+        self.include = include
+        self.exclude = exclude
         self._pending: dict[str, threading.Timer] = {}
         self._lock = threading.Lock()
 
@@ -513,6 +522,16 @@ class sync_files(FileSystemEventHandler):
             self.client.sync_file(full_path, rpath)
         except Exception as e:
             logger.error("ERROR for %s: %s", full_path.name, e)
+            return
+
+        stats = self.client.download_directory(
+            self.local_dir, self.remote_path,
+            recursive=True,
+            include=self.include,
+            exclude=self.exclude,
+        )
+        if stats["downloaded"]:
+            logger.info("Downloaded %d new file(s).", stats["downloaded"])
 
 def main() -> None:
     parser = argparse.ArgumentParser(
