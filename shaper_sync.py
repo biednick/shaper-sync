@@ -15,6 +15,7 @@ import argparse
 import fnmatch
 import logging
 import sys
+import threading
 from collections import Counter
 from datetime import datetime, time, timezone
 import time as t
@@ -453,24 +454,65 @@ class ShaperHubClient:
         observer.join()
 
 class sync_files(FileSystemEventHandler):
+    # Seconds to wait after the last event before uploading, to avoid
+    # reading a file that is still being written.
+    DEBOUNCE = 0.5
+
     def __init__(self, client: ShaperHubClient, local_dir: Path, remote_path: str):
         self.client = client
         self.local_dir = local_dir
         self.remote_path = remote_path
+        self._pending: dict[str, threading.Timer] = {}
+        self._lock = threading.Lock()
 
     def on_any_event(self, event):
-        print("Event detected:", event)
-        if event.event_type in ["created", "modified"]:
-            full_path = Path(event.src_path)
-            rel = full_path.parent.relative_to(self.local_dir)
-            rpath = self.remote_path.rstrip("/") + "/" if self.remote_path != "/" else "/"
-            if str(rel) != ".":
-               rpath += str(rel) + "/"
+        if event.is_directory:
+            return
 
-            try:
-                self.client.sync_file(full_path, rpath)
-            except Exception as e:
-                logger.error("ERROR for %s: %s", rel, e)
+        # Map watchdog event types to the file path that should be uploaded.
+        # "moved" is the atomic rename pattern editors use for safe saves
+        # (equivalent to inotify's IN_MOVED_TO).
+        if event.event_type in ("created", "modified"):
+            full_path = Path(event.src_path)
+        elif event.event_type == "moved":
+            full_path = Path(event.dest_path)
+        else:
+            return
+
+        # Skip hidden files
+        if full_path.name.startswith("."):
+            return
+
+        logger.debug("Event %s: %s", event.event_type, full_path)
+        self._schedule(full_path)
+
+    def _schedule(self, full_path: Path) -> None:
+        """Debounce uploads: reset the timer each time the file changes."""
+        key = str(full_path)
+        with self._lock:
+            existing = self._pending.pop(key, None)
+            if existing:
+                existing.cancel()
+            timer = threading.Timer(self.DEBOUNCE, self._upload, args=(full_path,))
+            self._pending[key] = timer
+            timer.start()
+
+    def _upload(self, full_path: Path) -> None:
+        with self._lock:
+            self._pending.pop(str(full_path), None)
+
+        if not full_path.is_file():
+            return
+
+        rel = full_path.parent.relative_to(self.local_dir)
+        rpath = self.remote_path.rstrip("/") + "/" if self.remote_path != "/" else "/"
+        if str(rel) != ".":
+            rpath += str(rel) + "/"
+
+        try:
+            self.client.sync_file(full_path, rpath)
+        except Exception as e:
+            logger.error("ERROR for %s: %s", full_path.name, e)
 
 def main() -> None:
     parser = argparse.ArgumentParser(
