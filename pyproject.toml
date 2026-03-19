@@ -5,7 +5,7 @@ description = "Synchronize a local directory to Shaper Hub"
 requires-python = ">=3.12"
 license = "MIT"
 dependencies = [
-    "inotify>=0.2.10",
+    "watchdog>=3.0",
     "requests>=2.28",
 ]
 
