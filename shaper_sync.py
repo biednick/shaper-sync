@@ -437,6 +437,7 @@ class ShaperHubClient:
         recursive: bool = True,
         include: list[str] | None = None,
         exclude: list[str] | None = None,
+        download: bool = False,
     ) -> None:
         """Watch a local directory for changes and sync them to Shaper Hub.
 
@@ -455,7 +456,7 @@ class ShaperHubClient:
         )
 
         observer = Observer()
-        event_handler = sync_files(self, local_dir, remote_path, include=include, exclude=exclude)
+        event_handler = sync_files(self, local_dir, remote_path, include=include, exclude=exclude, download=download)
         if recursive:
             observer.schedule(event_handler, local_dir, recursive=True)
         else:
@@ -482,12 +483,14 @@ class sync_files(FileSystemEventHandler):
         remote_path: str,
         include: list[str] | None = None,
         exclude: list[str] | None = None,
+        download: bool = False,
     ):
         self.client = client
         self.local_dir = local_dir
         self.remote_path = remote_path
         self.include = include
         self.exclude = exclude
+        self.download = download
         self._pending: dict[str, threading.Timer] = {}
         self._lock = threading.Lock()
         self._downloading: set[str] = set()
@@ -546,15 +549,16 @@ class sync_files(FileSystemEventHandler):
             logger.error("ERROR for %s: %s", full_path.name, e)
             return
 
-        stats = self.client.download_directory(
-            self.local_dir, self.remote_path,
-            recursive=True,
-            include=self.include,
-            exclude=self.exclude,
-            ignore=self._downloading,
-        )
-        if stats["downloaded"]:
-            logger.info("Downloaded %d new file(s).", stats["downloaded"])
+        if self.download:
+            stats = self.client.download_directory(
+                self.local_dir, self.remote_path,
+                recursive=True,
+                include=self.include,
+                exclude=self.exclude,
+                ignore=self._downloading,
+            )
+            if stats["downloaded"]:
+                logger.info("Downloaded %d new file(s).", stats["downloaded"])
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -627,6 +631,7 @@ def main() -> None:
             recursive=not args.no_recursive,
             include=args.include,
             exclude=args.exclude,
+            download=args.download,
         )
     elif args.download:
         stats = client.download_directory(
