@@ -200,12 +200,21 @@ class ShaperHubClient:
             for f in self.list_files(remote_path, file_type="file")
         }
 
-    def download_file(self, remote_entry: dict, local_dir: Path) -> None:
+    def download_file(
+        self,
+        remote_entry: dict,
+        local_dir: Path,
+        *,
+        ignore: set[str] | None = None,
+    ) -> None:
         """Download a remote file entry to local_dir.
 
         GET /blobs/{id} returns a 303 redirect to a presigned S3 URL.
         requests follows the redirect automatically, so we stream the
         final response body directly to disk.
+
+        If ignore is provided, the destination path is added to it before
+        writing and removed after, so watchdog can skip the event.
         """
         name = remote_entry["name"]
         blob_id = remote_entry["blobs"][0]
@@ -219,9 +228,15 @@ class ShaperHubClient:
         )
         resp.raise_for_status()
         dest = local_dir / name
-        with open(dest, "wb") as f:
-            for chunk in resp.iter_content(chunk_size=65536):
-                f.write(chunk)
+        if ignore is not None:
+            ignore.add(str(dest))
+        try:
+            with open(dest, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=65536):
+                    f.write(chunk)
+        finally:
+            if ignore is not None:
+                ignore.discard(str(dest))
         logger.info("Downloaded: %s", name)
 
     def download_directory(
@@ -233,6 +248,7 @@ class ShaperHubClient:
         recursive: bool = True,
         include: list[str] | None = None,
         exclude: list[str] | None = None,
+        ignore: set[str] | None = None,
     ) -> Counter:
         """Download files from Shaper Hub that are not present locally.
 
@@ -258,6 +274,7 @@ class ShaperHubClient:
                     recursive=True,
                     include=include,
                     exclude=exclude,
+                    ignore=ignore,
                 )
 
         remote_entries = self.list_files(remote_path, file_type="file")
@@ -290,7 +307,7 @@ class ShaperHubClient:
                 continue
             try:
                 logger.info("Downloading (%d/%d): %s...", n, total, name)
-                self.download_file(entry, local_dir)
+                self.download_file(entry, local_dir, ignore=ignore)
                 stats["downloaded"] += 1
             except Exception as e:
                 logger.error("ERROR downloading %s: %s", name, e)
@@ -473,6 +490,7 @@ class sync_files(FileSystemEventHandler):
         self.exclude = exclude
         self._pending: dict[str, threading.Timer] = {}
         self._lock = threading.Lock()
+        self._downloading: set[str] = set()
 
     def on_any_event(self, event):
         if event.is_directory:
@@ -490,6 +508,10 @@ class sync_files(FileSystemEventHandler):
 
         # Skip hidden files
         if full_path.name.startswith("."):
+            return
+
+        # Skip files currently being downloaded to avoid re-uploading them
+        if str(full_path) in self._downloading:
             return
 
         logger.debug("Event %s: %s", event.event_type, full_path)
@@ -529,6 +551,7 @@ class sync_files(FileSystemEventHandler):
             recursive=True,
             include=self.include,
             exclude=self.exclude,
+            ignore=self._downloading,
         )
         if stats["downloaded"]:
             logger.info("Downloaded %d new file(s).", stats["downloaded"])
