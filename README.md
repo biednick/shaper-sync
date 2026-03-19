@@ -84,3 +84,7 @@ docker run --rm \
   -v /path/to/designs:/data \
   ghcr.io/naps/shaper-sync /data --watch
 ```
+
+## Disclaimer
+This project is in no way, shape, or form associated with Shaper Tools. Shaper Tools does not 
+provide a public API, so this tool relies on a reverse engineered API developed by the contributors.
