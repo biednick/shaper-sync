@@ -199,6 +199,116 @@ class ShaperHubClient:
             for f in self.list_files(remote_path, file_type="file")
         }
 
+    def download_file(self, remote_entry: dict, local_dir: Path) -> None:
+        """Download a remote file entry to local_dir.
+
+        GET /blobs/{id} returns a 303 redirect to a presigned S3 URL.
+        requests follows the redirect automatically, so we stream the
+        final response body directly to disk.
+        """
+        name = remote_entry["name"]
+        blob_id = remote_entry["blobs"][0]
+        resp = self._request(
+            "GET", f"{API_URL}/blobs/{blob_id}",
+            stream=True, allow_redirects=True,
+        )
+        logger.debug(
+            "GET /blobs/%s -> %d %s (via %d redirect(s))",
+            blob_id, resp.status_code, resp.reason, len(resp.history),
+        )
+        resp.raise_for_status()
+        dest = local_dir / name
+        with open(dest, "wb") as f:
+            for chunk in resp.iter_content(chunk_size=65536):
+                f.write(chunk)
+        logger.info("Downloaded: %s", name)
+
+    def download_directory(
+        self,
+        local_dir: Path,
+        remote_path: str = "/",
+        *,
+        dry_run: bool = False,
+        recursive: bool = True,
+        include: list[str] | None = None,
+        exclude: list[str] | None = None,
+    ) -> Counter:
+        """Download files from Shaper Hub that are not present locally.
+
+        Returns a Counter with keys: downloaded, skipped, errors.
+        """
+        stats: Counter = Counter()
+        remote_path = remote_path.rstrip("/") + "/" if remote_path != "/" else "/"
+
+        if recursive:
+            for folder in self.list_files(remote_path, file_type="folder"):
+                name = folder["name"]
+                if not self._is_valid_windows_name(name):
+                    logger.warning("Skipping folder with unsupported name: %r", name)
+                    continue
+                logger.info("Directory: %s/", name)
+                sub_local = local_dir / name
+                if not dry_run:
+                    sub_local.mkdir(exist_ok=True)
+                stats += self.download_directory(
+                    sub_local,
+                    f"{remote_path}{name}/",
+                    dry_run=dry_run,
+                    recursive=True,
+                    include=include,
+                    exclude=exclude,
+                )
+
+        remote_entries = self.list_files(remote_path, file_type="file")
+        logger.debug("Remote entries: %s", [e["name"] for e in remote_entries])
+        local_names = {p.name for p in local_dir.iterdir() if p.is_file()} if not dry_run else set()
+
+        to_download = [
+            e for e in remote_entries
+            if self._file_matches(e["name"], include, exclude) and e["name"] not in local_names
+        ]
+        total = len(to_download)
+        logger.info("Files to download: %d", total)
+
+        for entry in remote_entries:
+            name = entry["name"]
+            if not self._is_valid_windows_name(name):
+                logger.warning("Skipping file with unsupported name: %r", name)
+                continue
+            if not self._file_matches(name, include, exclude):
+                logger.debug("Filtered out: %s", name)
+                continue
+            if name in local_names:
+                logger.info("Skipped (already local): %s", name)
+                stats["skipped"] += 1
+                continue
+            n = stats["downloaded"] + stats["errors"] + 1
+            if dry_run:
+                logger.info("[dry-run] Would download (%d/%d): %s", n, total, name)
+                stats["downloaded"] += 1
+                continue
+            try:
+                logger.info("Downloading (%d/%d): %s...", n, total, name)
+                self.download_file(entry, local_dir)
+                stats["downloaded"] += 1
+            except Exception as e:
+                logger.error("ERROR downloading %s: %s", name, e)
+                stats["errors"] += 1
+
+        return stats
+
+    @staticmethod
+    def _is_valid_windows_name(name: str) -> bool:
+        """Return False if name contains characters or patterns forbidden on Windows."""
+        import re
+        if re.search(r'[\\/:*?"<>|]', name):
+            return False
+        if re.match(r'^(CON|PRN|AUX|NUL|COM\d|LPT\d)(\.|$)', name, re.IGNORECASE):
+            return False
+        if name.endswith((" ", ".")):
+            return False
+        return True
+
     @staticmethod
     def _file_matches(
         name: str,
@@ -383,7 +493,11 @@ def main() -> None:
         "--remote-path", default="/", help="Remote destination path (default: /)."
     )
     parser.add_argument(
-        "--dry-run", action="store_true", help="Simulate without uploading anything."
+        "--download", action="store_true",
+        help="Download files from Shaper Hub that are not present locally.",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="Simulate without uploading/downloading anything."
     )
     parser.add_argument(
         "--no-recursive", action="store_true", help="Do not synchronize subdirectories."
@@ -429,6 +543,22 @@ def main() -> None:
             recursive=not args.no_recursive,
             include=args.include,
             exclude=args.exclude,
+        )
+    elif args.download:
+        stats = client.download_directory(
+            args.directory,
+            args.remote_path,
+            dry_run=args.dry_run,
+            recursive=not args.no_recursive,
+            include=args.include,
+            exclude=args.exclude,
+        )
+        logger.info("")
+        logger.info(
+            "Done: %d downloaded, %d skipped, %d error(s).",
+            stats["downloaded"],
+            stats["skipped"],
+            stats["errors"],
         )
     else:
         stats = client.sync_directory(
